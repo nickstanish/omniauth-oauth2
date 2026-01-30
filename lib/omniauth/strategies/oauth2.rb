@@ -72,7 +72,7 @@ module OmniAuth
                         .merge(pkce_authorize_params)
 
         session["omniauth.pkce.verifier"] = options.pkce_verifier if options.pkce
-        session["omniauth.state"] = params[:state]
+        store_state(params[:state])
 
         params
       end
@@ -83,7 +83,7 @@ module OmniAuth
 
       def callback_phase # rubocop:disable Metrics/AbcSize, Metrics/CyclomaticComplexity, Metrics/MethodLength, Metrics/PerceivedComplexity
         error = request.params["error_reason"] || request.params["error"]
-        if !options.provider_ignores_state && (request.params["state"].to_s.empty? || !secure_compare(request.params["state"], session.delete("omniauth.state")))
+        if !options.provider_ignores_state && (request.params["state"].to_s.empty? || !valid_state?(request.params["state"]))
           fail!(:csrf_detected, CallbackError.new(:csrf_detected, "CSRF detected"))
         elsif error
           fail!(error, CallbackError.new(request.params["error"], request.params["error_description"] || request.params["error_reason"], request.params["error_uri"]))
@@ -101,6 +101,39 @@ module OmniAuth
       end
 
     protected
+
+      def copy_legacy_session_state
+        return unless session.key?("omniauth.state")
+        old_state = session.delete('omniauth.state')
+
+        return unless old_state
+
+        session["omniauth.states"] = Array(session["omniauth.states"]) + Array(old_state)
+      end
+
+      def store_state(state)
+        copy_legacy_session_state
+        session["omniauth.states"] = Array(session["omniauth.states"])
+        session["omniauth.states"] << state
+      end
+
+      def valid_state?(state)
+        copy_legacy_session_state
+
+        Array(session["omniauth.states"]).each_with_index do |stored_state, index|
+          if secure_compare(state, stored_state)
+            delete_state(stored_state)
+            return true
+          end
+        end
+
+        false
+      end
+
+      def delete_state(state)
+        session["omniauth.states"] = Array(session["omniauth.states"])
+        session["omniauth.states"] = (session["omniauth.states"] - [state]).uniq
+      end
 
       def pkce_authorize_params
         return {} unless options.pkce
