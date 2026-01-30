@@ -58,13 +58,14 @@ describe OmniAuth::Strategies::OAuth2 do
     it "includes random state in the authorize params" do
       instance = subject.new("abc", "def")
       expect(instance.authorize_params.keys).to eq(["state"])
-      expect(instance.session["omniauth.states"]).to include(instance.authorize_params["state"])
+      state = instance.authorize_params["state"]
+      expect(instance.session["omniauth.oauth2_states"]).to have_key(state)
     end
 
     it "includes custom state in the authorize params" do
       instance = subject.new("abc", "def", :state => proc { "qux" })
       expect(instance.authorize_params.keys).to eq(["state"])
-      expect(instance.session["omniauth.states"]).to include("qux")
+      expect(instance.session["omniauth.oauth2_states"]).to have_key("qux")
     end
 
     it "supports multiple concurrent states" do
@@ -72,24 +73,26 @@ describe OmniAuth::Strategies::OAuth2 do
       state1 = instance.authorize_params["state"]
       state2 = instance.authorize_params["state"]
       state3 = instance.authorize_params["state"]
-      expect(instance.session["omniauth.states"]).to eq([state1, state2, state3])
+      expect(instance.session["omniauth.oauth2_states"].keys).to match_array([state1, state2, state3])
     end
 
-    it "migrates old single state to states array" do
+    it "migrates old single state to states hash" do
       instance = subject.new("abc", "def")
       instance.authorize_params
       instance.session["omniauth.state"] = "old_state"
-      instance.session.delete("omniauth.states")
+      instance.session.delete("omniauth.oauth2_states")
       new_state = instance.authorize_params["state"]
-      expect(instance.session["omniauth.states"]).to eq(["old_state", new_state])
+      expect(instance.session["omniauth.oauth2_states"].keys).to match_array(["old_state", new_state])
       expect(instance.session["omniauth.state"]).to be_nil
     end
 
     it "includes PKCE parameters if enabled" do
       instance = subject.new("abc", "def", :pkce => true)
-      expect(instance.authorize_params[:code_challenge]).to be_a(String)
-      expect(instance.authorize_params[:code_challenge_method]).to eq("S256")
-      expect(instance.session["omniauth.pkce.verifier"]).to be_a(String)
+      params = instance.authorize_params
+      expect(params[:code_challenge]).to be_a(String)
+      expect(params[:code_challenge_method]).to eq("S256")
+      state = params["state"]
+      expect(instance.session["omniauth.oauth2_states"][state]["pkce_verifier"]).to be_a(String)
     end
   end
 
@@ -108,8 +111,9 @@ describe OmniAuth::Strategies::OAuth2 do
 
     it "includes the PKCE code_verifier if enabled" do
       instance = subject.new("abc", "def", :pkce => true)
-      # setup session
-      instance.authorize_params
+      params = instance.authorize_params
+      state = params["state"]
+      allow(instance).to receive(:request).and_return(double("Request", :params => {"state" => state}))
       expect(instance.token_params[:code_verifier]).to be_a(String)
     end
   end
@@ -126,20 +130,24 @@ describe OmniAuth::Strategies::OAuth2 do
       end
     end
 
-    context "with new states array format" do
+    context "with new states hash format" do
       it "calls fail with the error received" do
-        session = {"omniauth.states" => [state]}
+        session = {"omniauth.oauth2_states" => {state => {"iat" => Time.now.to_i, "exp" => nil}}}
         allow(instance).to receive(:session).and_return(session)
         expect(instance).to receive(:fail!).with("user_denied", anything)
         instance.callback_phase
       end
 
-      it "removes the validated state from the states array" do
-        session = {"omniauth.states" => [state, "other_state"]}
+      it "marks the validated state as expired" do
+        session = {"omniauth.oauth2_states" => {
+          state => {"iat" => Time.now.to_i, "exp" => nil},
+          "other_state" => {"iat" => Time.now.to_i, "exp" => nil}
+        }}
         allow(instance).to receive(:session).and_return(session)
         expect(instance).to receive(:fail!).with("user_denied", anything)
         instance.callback_phase
-        expect(session["omniauth.states"]).to eq(["other_state"])
+        expect(session["omniauth.oauth2_states"][state]["exp"]).not_to be_nil
+        expect(session["omniauth.oauth2_states"]["other_state"]["exp"]).to be_nil
       end
     end
 
@@ -180,7 +188,7 @@ describe OmniAuth::Strategies::OAuth2 do
 
     it "calls fail with a CSRF error if the state is invalid" do
       params["state"] = "invalid"
-      allow(instance).to receive(:session).and_return({"omniauth.states" => [state]})
+      allow(instance).to receive(:session).and_return({"omniauth.oauth2_states" => {state => {"iat" => Time.now.to_i, "exp" => nil}}})
 
       expect(instance).to receive(:fail!).with(:csrf_detected, anything)
       instance.callback_phase
@@ -191,25 +199,47 @@ describe OmniAuth::Strategies::OAuth2 do
       state2 = "state2"
       state3 = "state3"
       params["state"] = state2
-      session = {"omniauth.states" => [state1, state2, state3]}
+      session = {"omniauth.oauth2_states" => {
+        state1 => {"iat" => Time.now.to_i, "exp" => nil},
+        state2 => {"iat" => Time.now.to_i, "exp" => nil},
+        state3 => {"iat" => Time.now.to_i, "exp" => nil}
+      }}
       allow(instance).to receive(:session).and_return(session)
 
       expect(instance).to receive(:fail!).with("user_denied", anything)
       instance.callback_phase
-      expect(session["omniauth.states"]).to eq([state1, state3])
+      expect(session["omniauth.oauth2_states"][state2]["exp"]).not_to be_nil
+      expect(session["omniauth.oauth2_states"][state1]["exp"]).to be_nil
+      expect(session["omniauth.oauth2_states"][state3]["exp"]).to be_nil
     end
 
-    it "removes duplicate states" do
+    it "prevents replay attacks by rejecting already-used states" do
+      params["state"] = state
+      session = {"omniauth.oauth2_states" => {
+        state => {"iat" => Time.now.to_i, "exp" => Time.now.to_i - 60}
+      }}
+      allow(instance).to receive(:session).and_return(session)
+
+      expect(instance).to receive(:fail!).with(:csrf_detected, anything)
+      instance.callback_phase
+    end
+
+    it "cleans up all states with exp set" do
       state1 = "state1"
       state2 = "state2"
       state3 = "state3"
-      params["state"] = state2
-      session = {"omniauth.states" => [state1, state1, state2, state2, state3, state3]}
+      session = {"omniauth.oauth2_states" => {
+        state1 => {"iat" => Time.now.to_i, "exp" => Time.now.to_i},
+        state2 => {"iat" => Time.now.to_i, "exp" => Time.now.to_i - 60},
+        state3 => {"iat" => Time.now.to_i, "exp" => nil}
+      }}
       allow(instance).to receive(:session).and_return(session)
 
-      expect(instance).to receive(:fail!).with("user_denied", anything)
-      instance.callback_phase
-      expect(session["omniauth.states"]).to eq([state1, state3])
+      instance.send(:cleanup_expired_state)
+
+      expect(session["omniauth.oauth2_states"]).not_to have_key(state1)
+      expect(session["omniauth.oauth2_states"]).not_to have_key(state2)
+      expect(session["omniauth.oauth2_states"]).to have_key(state3)
     end
 
     describe 'exception handlings' do
@@ -218,7 +248,7 @@ describe OmniAuth::Strategies::OAuth2 do
       end
 
       before do
-        allow(instance).to receive(:session).and_return({"omniauth.states" => [state]})
+        allow(instance).to receive(:session).and_return({"omniauth.oauth2_states" => {state => {"iat" => Time.now.to_i, "exp" => nil}}})
         allow_any_instance_of(OmniAuth::Strategies::OAuth2).to receive(:build_access_token).and_raise(exception)
       end
 

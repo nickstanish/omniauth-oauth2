@@ -71,8 +71,9 @@ module OmniAuth
                         .merge(options_for("authorize"))
                         .merge(pkce_authorize_params)
 
-        session["omniauth.pkce.verifier"] = options.pkce_verifier if options.pkce
-        store_state(params[:state])
+        metadata = {}
+        metadata["pkce_verifier"] = options.pkce_verifier if options.pkce
+        store_state(params[:state], metadata)
 
         params
       end
@@ -90,6 +91,7 @@ module OmniAuth
         else
           self.access_token = build_access_token
           self.access_token = access_token.refresh! if access_token.expired?
+          cleanup_expired_state
           super
         end
       rescue ::OAuth2::Error, CallbackError => e
@@ -102,37 +104,61 @@ module OmniAuth
 
     protected
 
-      def copy_legacy_session_state
+      def migrate_legacy_session
         return unless session.key?("omniauth.state")
-        old_state = session.delete('omniauth.state')
+        old_state = session.delete("omniauth.state")
+        old_verifier = session.delete("omniauth.pkce.verifier")
 
         return unless old_state
 
-        session["omniauth.states"] = Array(session["omniauth.states"]) + Array(old_state)
+        session["omniauth.oauth2_states"] ||= {}
+        session["omniauth.oauth2_states"][old_state] = {"iat" => Time.now.to_i, "exp" => nil}
+        session["omniauth.oauth2_states"][old_state]["pkce_verifier"] = old_verifier if old_verifier
       end
 
-      def store_state(state)
-        copy_legacy_session_state
-        session["omniauth.states"] = Array(session["omniauth.states"])
-        session["omniauth.states"] << state
+      def store_state(state, metadata = {})
+        migrate_legacy_session
+        session["omniauth.oauth2_states"] ||= {}
+        session["omniauth.oauth2_states"][state] = metadata.merge("iat" => Time.now.to_i, "exp" => nil)
       end
 
-      def valid_state?(state)
-        copy_legacy_session_state
+      def find_state(state)
+        session["omniauth.oauth2_states"] ||= {}
 
-        Array(session["omniauth.states"]).each_with_index do |stored_state, index|
+        session["omniauth.oauth2_states"].each_pair do |stored_state, metadata|
           if secure_compare(state, stored_state)
-            delete_state(stored_state)
-            return true
+            return [stored_state, metadata]
           end
         end
 
-        false
+        nil
       end
 
-      def delete_state(state)
-        session["omniauth.states"] = Array(session["omniauth.states"])
-        session["omniauth.states"] = (session["omniauth.states"] - [state]).uniq
+      def valid_state?(state)
+        migrate_legacy_session
+        found = find_state(state)
+
+        return false unless found
+
+        stored_state, metadata = found
+
+        return false if metadata["exp"]
+
+        session["omniauth.oauth2_states"][stored_state]["exp"] = Time.now.to_i
+
+        true
+      end
+
+      def get_state_metadata(state)
+        found = find_state(state)
+        found ? found[1] : nil
+      end
+
+      def cleanup_expired_state
+        session["omniauth.oauth2_states"] ||= {}
+        session["omniauth.oauth2_states"].delete_if do |_state, metadata|
+          metadata["exp"]
+        end
       end
 
       def pkce_authorize_params
@@ -151,7 +177,11 @@ module OmniAuth
       def pkce_token_params
         return {} unless options.pkce
 
-        {:code_verifier => session.delete("omniauth.pkce.verifier")}
+        state = request.params["state"]
+        metadata = get_state_metadata(state)
+        verifier = metadata && metadata["pkce_verifier"]
+
+        {:code_verifier => verifier}
       end
 
       def build_access_token
